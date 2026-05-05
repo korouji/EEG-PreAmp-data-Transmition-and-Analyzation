@@ -1,155 +1,248 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <Wire.h>
+#include <esp_wifi.h>  
 
-const char* ssid = "POCO X3 Pro";
-const char* password = "12345678";
+// WiFi 
+const char* ssid = "Nothing";
+const char* password = "123456780";
 
 WiFiUDP udp;
-const uint16_t DATA_PORT = 5005;
+unsigned int localPort = 5005;
+IPAddress pythonIP;
+unsigned int pythonPort;
+volatile bool isRunning = false; 
 
-WiFiUDP cmdUdp;
-const uint16_t CMD_PORT = 5006;
+// I2C 
+#define I2C_ADS_SDA 21
+#define I2C_ADS_SCL 22
 
-#define ADXL_ADDR 0x53
-#define REG_DEVID        0x00
-#define REG_POWER_CTL    0x2D
-#define REG_DATA_FORMAT  0x31
-#define REG_BW_RATE      0x2C
-#define REG_DATAX0       0x32
+#define I2C_IMU_SDA 18
+#define I2C_IMU_SCL 19
 
-#define EEG_CH1 4
-#define EEG_CH2 5
-#define EEG_CH3 6
-#define EEG_CH4 7
+TwoWire I2C_ADS = TwoWire(0);
+TwoWire I2C_IMU = TwoWire(1);
 
-const float VREF = 3.3;        // ولتاژ مرجع ADC ESP32
-const int GAIN = 1000;         // گین پری‌امپ
-const int ADC_BASELINE = 1860; // baseline ADC برای 1.5V
+// Addresses 
+const uint8_t ADS1_ADDR = 0x48;
+const uint8_t ADS2_ADDR = 0x49;
+const uint8_t IMU_ADDR  = 0x53;
 
-const uint32_t SAMPLE_PERIOD_MS = 10; // 100Hz
-uint32_t lastSampleTime = 0;
+// ADS Gain
+uint16_t ADS_GAIN = 0x0800; 
+// گین 16 برای +/- 0.256V 0x0A00
 
-bool samplingEnabled = false;
+// BASE_CONFIG برای single-shot, DR=111 برای 860 SPS واقعی
+const uint16_t BASE_CONFIG_0_1 = 0x81F3;  
+const uint16_t BASE_CONFIG_2_3 = 0xB1F3;  
 
-// I2C helpers
-void i2cWrite(uint8_t reg, uint8_t data) {
-  Wire.beginTransmission(ADXL_ADDR);
-  Wire.write(reg);
-  Wire.write(data);
-  Wire.endTransmission();
+// Batch 
+const int BATCH_SIZE = 20;  
+
+// Packet 
+#pragma pack(push, 1)
+struct SensorDataPacket {
+  uint8_t header = 0xAA;
+  uint8_t packetType = 0x01;
+  uint8_t counter;
+  int16_t eeg1;
+  int16_t eeg2;
+  int16_t eeg3;
+  int16_t eeg4;
+  int16_t accelX;
+  int16_t accelY;
+  int16_t accelZ;
+  uint8_t footer = 0x55;
+};
+#pragma pack(pop)
+
+SensorDataPacket buffer[BATCH_SIZE];
+uint8_t packetCounter = 0;
+int batchIndex = 0;
+
+// Queue برای FreeRTOS
+QueueHandle_t dataQueue;
+
+inline void writeRegister(uint8_t addr, uint8_t reg, uint16_t value) __attribute__((always_inline));
+inline void writeRegister(uint8_t addr, uint8_t reg, uint16_t value) {
+  I2C_ADS.beginTransmission(addr);
+  I2C_ADS.write(reg);
+  I2C_ADS.write((uint8_t)(value >> 8));
+  I2C_ADS.write((uint8_t)(value & 0xFF));
+  I2C_ADS.endTransmission();
 }
 
-bool i2cRead(uint8_t reg, uint8_t* buf, uint8_t len) {
-  Wire.beginTransmission(ADXL_ADDR);
-  Wire.write(reg);
-  if(Wire.endTransmission(false) != 0) return false;
-  Wire.requestFrom(ADXL_ADDR, len);
-  for (uint8_t i = 0; i < len; i++) {
-    if(Wire.available()) buf[i] = Wire.read();
-    else return false;
+inline int16_t readRegister(uint8_t addr, uint8_t reg) __attribute__((always_inline));
+inline int16_t readRegister(uint8_t addr, uint8_t reg) {
+  I2C_ADS.beginTransmission(addr);
+  I2C_ADS.write(reg);
+  I2C_ADS.endTransmission();
+  I2C_ADS.requestFrom(addr, (uint8_t)2);
+  return (I2C_ADS.read() << 8) | I2C_ADS.read();
+}
+
+inline void readIMU() __attribute__((always_inline));
+inline void readIMU() {
+  I2C_IMU.beginTransmission(IMU_ADDR);
+  I2C_IMU.write(0x32);
+  I2C_IMU.endTransmission(false);
+  I2C_IMU.requestFrom(IMU_ADDR, (uint8_t)6);
+
+  if (I2C_IMU.available() == 6) {
+    uint8_t x0 = I2C_IMU.read(); uint8_t x1 = I2C_IMU.read();
+    uint8_t y0 = I2C_IMU.read(); uint8_t y1 = I2C_IMU.read();
+    uint8_t z0 = I2C_IMU.read(); uint8_t z1 = I2C_IMU.read();
+
+    buffer[batchIndex].accelX = (x1 << 8) | x0;  
+    buffer[batchIndex].accelY = (y1 << 8) | y0;  
+    buffer[batchIndex].accelZ = (z1 << 8) | z0;
   }
-  return true;
 }
 
-// ADC to µV 
-int16_t adc2uV(int raw) {
-  float v = (raw - ADC_BASELINE) / 4095.0 * VREF;
-  return (int16_t)(v * 1e6 / GAIN);
+void networkTask(void *pvParameters) {
+  SensorDataPacket sendBuffer[BATCH_SIZE];
+  
+  for (;;) {
+    int packetSize = udp.parsePacket();
+    if (packetSize) {
+      char incoming[20];
+      int len = udp.read(incoming, 20);
+      if (len > 0) incoming[len] = 0;
+
+      String cmd = String(incoming);  
+      cmd.trim();  
+
+      if (cmd == "START") {  
+        pythonIP = udp.remoteIP();  
+        pythonPort = 5006;  
+        isRunning = true;  
+        Serial.println("Streaming STARTED");  
+      }  
+      else if (cmd == "STOP") {  
+        isRunning = false;  
+        Serial.println("Streaming STOPPED");  
+      }
+    }
+
+    if (isRunning) {
+      if (xQueueReceive(dataQueue, &sendBuffer, 10 / portTICK_PERIOD_MS) == pdTRUE) {
+        udp.beginPacket(pythonIP, pythonPort);  
+        udp.write((uint8_t*)&sendBuffer, sizeof(SensorDataPacket) * BATCH_SIZE);  
+        udp.endPacket();
+      }
+    } else {
+      vTaskDelay(10 / portTICK_PERIOD_MS); 
+    }
+  }
 }
 
+// ================= Setup =================
 void setup() {
   Serial.begin(115200);
+  delay(1000);
 
-  // I2C
-  Wire.begin(16, 15);
-  Wire.setClock(400000);
+  I2C_ADS.begin(I2C_ADS_SDA, I2C_ADS_SCL, 800000);  
+  I2C_IMU.begin(I2C_IMU_SDA, I2C_IMU_SCL, 800000);
 
-  // Check ADXL345
-  uint8_t devid;
-  if(!i2cRead(REG_DEVID, &devid, 1) || devid != 0xE5) {
-    Serial.println("ADXL345 not found!");
-    while(1);
-  }
+  // ADXL345 init
+  I2C_IMU.beginTransmission(IMU_ADDR);
+  I2C_IMU.write(0x2D);
+  I2C_IMU.write(0x08);
+  I2C_IMU.endTransmission();
 
-  // ADXL345 config
-  i2cWrite(REG_POWER_CTL, 0x00); // standby
-  i2cWrite(REG_BW_RATE, 0x0A);   // 100Hz
-  i2cWrite(REG_DATA_FORMAT, 0x08); // full res ±2g
-  i2cWrite(REG_POWER_CTL, 0x08); // measurement mode
+  I2C_IMU.beginTransmission(IMU_ADDR);
+  I2C_IMU.write(0x31);
+  I2C_IMU.write(0x08);
+  I2C_IMU.endTransmission();
 
-  // WiFi
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
+
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\nWiFi connected");
-  Serial.print("ESP IP: "); Serial.println(WiFi.localIP());
-  Serial.print("Broadcast IP: "); Serial.println(WiFi.broadcastIP());
 
-  // UDP
-  udp.begin(DATA_PORT);
-  cmdUdp.begin(CMD_PORT);
-  Serial.printf("Command listener started on port %d\n", CMD_PORT);
+  Serial.println("\nWiFi Connected");
+  Serial.print("ESP32 IP Address: ");
+  Serial.println(WiFi.localIP());
+  esp_wifi_set_ps(WIFI_PS_NONE);  
+
+  udp.begin(localPort);
+  Serial.println("UDP Ready");
+
+  dataQueue = xQueueCreate(10, sizeof(SensorDataPacket) * BATCH_SIZE);
+
+  xTaskCreatePinnedToCore(
+    networkTask,      
+    "NetworkTask",    
+    4096,             
+    NULL,             
+    1,                
+    NULL,             
+    0                 // Core 0
+  );
 }
 
 void loop() {
-  int packetSize = cmdUdp.parsePacket();
-  if (packetSize) {
-    char cmd[10];
-    int len = cmdUdp.read(cmd, 9);
-    cmd[len] = 0;
+  if (isRunning) {
+    unsigned long cycle_start = micros();
 
-    if (strcmp(cmd, "START") == 0) {
-      samplingEnabled = true;
-      Serial.println("Sampling STARTED");
-    } else if (strcmp(cmd, "STOP") == 0) {
-      samplingEnabled = false;
-      Serial.println("Sampling STOPPED");
-    }
-  }
+    uint16_t config_0_1 = BASE_CONFIG_0_1 | ADS_GAIN;  
 
-  uint32_t now = millis();
-  if (samplingEnabled && (now - lastSampleTime >= SAMPLE_PERIOD_MS)) {
-    lastSampleTime = now;
+    writeRegister(ADS1_ADDR, 0x01, config_0_1);
+    writeRegister(ADS2_ADDR, 0x01, config_0_1);
 
-    int16_t eeg[4];
-    eeg[0] = adc2uV(analogRead(EEG_CH1));
-    eeg[1] = adc2uV(analogRead(EEG_CH2));
-    eeg[2] = adc2uV(analogRead(EEG_CH3));
-    eeg[3] = adc2uV(analogRead(EEG_CH4));
+    delayMicroseconds(1163);
 
-    uint8_t raw[6];
-    int16_t ax=0, ay=0, az=0;
-    if(i2cRead(REG_DATAX0, raw, 6)) {
-      ax = (raw[1]<<8) | raw[0];
-      ay = (raw[3]<<8) | raw[2];
-      az = (raw[5]<<8) | raw[4];
-    }
+    buffer[batchIndex].eeg1 = readRegister(ADS1_ADDR, 0x00);  
+    buffer[batchIndex].eeg3 = readRegister(ADS2_ADDR, 0x00);  
 
-    uint8_t packet[16];
-    packet[0] = 0xAA;
-    packet[1] = 0x55;
+    uint16_t config_2_3 = BASE_CONFIG_2_3 | ADS_GAIN;  
+    writeRegister(ADS1_ADDR, 0x01, config_2_3);  
+    writeRegister(ADS2_ADDR, 0x01, config_2_3);
 
-    for(int i=0; i<4; i++){
-      packet[2+i*2] = eeg[i] & 0xFF;
-      packet[3+i*2] = eeg[i] >> 8;
+    unsigned long t = micros();
+    readIMU();  
+    unsigned long elapsed = micros() - t;
+
+    if (elapsed < 1163) {  
+      delayMicroseconds(1163 - elapsed);  
+    }  
+
+    buffer[batchIndex].eeg2 = readRegister(ADS1_ADDR, 0x00);  
+    buffer[batchIndex].eeg4 = readRegister(ADS2_ADDR, 0x00);  
+
+    buffer[batchIndex].counter = packetCounter++;  
+    buffer[batchIndex].header = 0xAA;
+    buffer[batchIndex].packetType = 0x01;
+    buffer[batchIndex].footer = 0x55;
+
+    batchIndex++;
+
+    if (batchIndex == BATCH_SIZE) {
+      xQueueSend(dataQueue, &buffer, 0); 
+      batchIndex = 0;
     }
 
-    packet[10] = ax & 0xFF;
-    packet[11] = ax >> 8;
-    packet[12] = ay & 0xFF;
-    packet[13] = ay >> 8;
-    packet[14] = az & 0xFF;
-    packet[15] = az >> 8;
-
-    IPAddress bcast = WiFi.broadcastIP();
-    udp.beginPacket(bcast, DATA_PORT);
-    udp.write(packet, sizeof(packet));
-    udp.endPacket();
-
-    Serial.printf("EEG[uV]: %d %d %d %d | IMU: %d %d %d\n",
-                  eeg[0], eeg[1], eeg[2], eeg[3], ax, ay, az);
+    static uint32_t count = 0;
+    static unsigned long total_cycle_time = 0;
+    static unsigned long last_time = millis();
+    
+    count++;   
+    total_cycle_time += (micros() - cycle_start);
+    
+    if (millis() - last_time >= 1000) {
+      Serial.print("Rate: ");
+      Serial.print(count);  // Hz
+      Serial.print(" Avg cycle us: ");
+      Serial.println(total_cycle_time / count);
+      
+      count = 0;
+      total_cycle_time = 0;
+      last_time = millis();
+    }
+  } else {
+    vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 }
